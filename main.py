@@ -1,14 +1,20 @@
+import asyncio
 import json
 import os
+from flask_log_server import (LOGS, run_flask, should_stop, set_wallet_status, log_wallet, WALLET_STATUS, GLOBAL_LOOP_EVENT, GLOBAL_LOOP_INTERVAL, LOOP_INTERVALS, GLOBAL_CONFIG, config_lock)
+import threading
+import aiohttp
 import requests
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from datetime import datetime
-from web3 import Web3
+from web3 import Web3, HTTPProvider
 import random
 import time
 from eth_abi import encode as abi_encode
 from colorama import init, Fore, Style
+from config import *
+from abi import ERC20_ABI, SWAP_ROUTER_ABI, POSITION_MANAGER_ABI
 
 init(autoreset=True)
 
@@ -22,120 +28,62 @@ class Colors:
     bold = Style.BRIGHT
     reset = Style.RESET_ALL
 
-
-PHAROS_RPC = "https://testnet.dplabs-internal.com"
-PHAROS_API = "https://api.pharosnetwork.xyz"
-INVITE_CODE = "g4oanA8cB1e82QD1"
-KEYS_PATH = "private_keys.txt"
 w3 = Web3(Web3.HTTPProvider(PHAROS_RPC))
-SWAP_CONTRACT_ADDRESS = "0x1a4de519154ae51200b0ad7c90f7fac75547888a"
-POSITION_MANAGER = Web3.to_checksum_address("0xf8a1d4ff0f9b9af7ce58e1fc1833688f3bfd6115")
-WPHRS = "0x76aaada469d23216be5f7c596fa25f282ff9b364"
-USDC = "0xad902cf99c2de2f1ba5ec4d642fd7e49cae9ee37"
-
-ERC20_ABI = ("""
-[
-  {"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},
-  {"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"},
-  {"constant":true,"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"remaining","type":"uint256"}],"type":"function"}
-]
-""")
-
-SWAP_ROUTER_ABI = json.loads("""
-[
-  {
-    "inputs": [
-      {
-        "components": [
-          {"internalType": "address", "name": "tokenIn", "type": "address"},
-          {"internalType": "address", "name": "tokenOut", "type": "address"},
-          {"internalType": "uint24", "name": "fee", "type": "uint24"},
-          {"internalType": "address", "name": "recipient", "type": "address"},
-          {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
-          {"internalType": "uint256", "name": "amountOutMinimum", "type": "uint256"},
-          {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"}
-        ],
-        "internalType": "struct IV3SwapRouter.ExactInputSingleParams",
-        "name": "params",
-        "type": "tuple"
-      }
-    ],
-    "name": "exactInputSingle",
-    "outputs": [
-      {"internalType": "uint256", "name": "amountOut", "type": "uint256"}
-    ],
-    "stateMutability": "payable",
-    "type": "function"
-  },
-  {
-    "inputs": [
-      {"internalType": "bytes[]", "name": "data", "type": "bytes[]"}
-    ],
-    "name": "multicall",
-    "outputs": [
-      {"internalType": "bytes[]", "name": "results", "type": "bytes[]"}
-    ],
-    "stateMutability": "payable",
-    "type": "function"
-  }
-]
-""")
-
-CONTRACT_ABI = [
-    {
-        "inputs": [
-            {"internalType": "uint256", "name": "collectionAndSelfcalls", "type": "uint256"},
-            {"internalType": "bytes[]", "name": "data", "type": "bytes[]"}
-        ],
-        "name": "multicall",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    }
-]
-
-position_manager_abi = [
-    {
-        "inputs": [
-            {
-                "components": [
-                    {"internalType": "address", "name": "token0", "type": "address"},
-                    {"internalType": "address", "name": "token1", "type": "address"},
-                    {"internalType": "uint24", "name": "fee", "type": "uint24"},
-                    {"internalType": "int24", "name": "tickLower", "type": "int24"},
-                    {"internalType": "int24", "name": "tickUpper", "type": "int24"},
-                    {"internalType": "uint256", "name": "amount0Desired", "type": "uint256"},
-                    {"internalType": "uint256", "name": "amount1Desired", "type": "uint256"},
-                    {"internalType": "uint256", "name": "amount0Min", "type": "uint256"},
-                    {"internalType": "uint256", "name": "amount1Min", "type": "uint256"},
-                    {"internalType": "address", "name": "recipient", "type": "address"},
-                    {"internalType": "uint256", "name": "deadline", "type": "uint256"}
-                ],
-                "internalType": "struct INonfungiblePositionManager.MintParams",
-                "name": "params",
-                "type": "tuple"
-            }
-        ],
-        "name": "mint",
-        "outputs": [
-            {"internalType": "uint256", "name": "tokenId", "type": "uint256"},
-            {"internalType": "uint128", "name": "liquidity", "type": "uint128"},
-            {"internalType": "uint256", "name": "amount0", "type": "uint256"},
-            {"internalType": "uint256", "name": "amount1", "type": "uint256"}
-        ],
-        "stateMutability": "payable",
-        "type": "function"
-    }
-]
 
 erc20_abi = json.loads(ERC20_ABI)
-def load_proxies(filename="proxies.txt"):
+swap_router_abi = json.loads(SWAP_ROUTER_ABI)
+
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
+time.sleep(2)
+
+def log_wallet(address, msg):
+    print(f"[{address[:8]}] {msg}")
+    LOGS.setdefault(address, []).append(msg)
+    if len(LOGS[address]) > 1000:
+        LOGS[address] = LOGS[address][-1000:]
+
+def load_private_keys():
+    if not os.path.exists(KEYS_PATH):
+        print(f"[!] File {KEYS_PATH} not found!")
+        return []
+    with open(KEYS_PATH, "r") as f:
+        keys = [line.strip() for line in f if line.strip()]
+    return keys
+
+def load_proxies(filename=None):
+    if filename is None:
+        filename = PROXY_PATH
     try:
         with open(filename, "r") as f:
             return [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
-        print("[!] File proxies.txt not found — launching without proxy")
+        print(f"[!] File {filename} not found — launching without proxy")
         return []
+
+async def safe_json(resp, context=""):
+    try:
+        return await resp.json(content_type=None)
+    except Exception:
+        print(f"[!] Response not JSON for {context}")
+        return None
+
+def normalize_proxy(proxy: str) -> str:
+    if proxy and not proxy.startswith("http"):
+        return "http://" + proxy
+    return proxy
+
+def get_w3(proxy: str = None) -> Web3:
+    if proxy:
+        session = requests.Session()
+        session.proxies = {"http": proxy, "https": proxy}
+        provider = HTTPProvider(PHAROS_RPC, session=session)
+        return Web3(provider)
+    else:
+        return Web3(Web3.HTTPProvider(PHAROS_RPC))
+
+def get_aiohttp_proxy(proxy: str = None) -> str | None:
+    return proxy if proxy else None
 
 def encode_exact_input_single(token_in, token_out, fee, recipient, amount_in, amount_out_min, sqrt_price_limit=0):
     selector = bytes.fromhex("04e45aaf")
@@ -153,9 +101,15 @@ def encode_exact_input_single(token_in, token_out, fee, recipient, amount_in, am
     ]
     return selector + abi_encode(types, args)
 
-def claim_faucet(pk, proxy=None):
+async def claim_faucet(pk, proxy=None):
+    proxy_url = normalize_proxy(proxy) if proxy else None
+    timeout = aiohttp.ClientTimeout(total=30)
     acct = Account.from_key(pk)
     address = acct.address
+
+    def _log(msg):
+        log_wallet(address, msg)
+
     message = encode_defunct(text="pharos")
     signed_message = Account.sign_message(message, pk)
     signature = signed_message.signature.hex()
@@ -175,62 +129,61 @@ def claim_faucet(pk, proxy=None):
         "Referrer-Policy": "strict-origin-when-cross-origin",
         "User-Agent": "Mozilla/5.0 (compatible)"
     }
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    try:
-        login_resp = requests.post(login_url, headers=headers, proxies=proxies)
-        login_data = login_resp.json()
-        if login_data.get("code") != 0 or "jwt" not in login_data.get("data", {}):
-            print(f"[!] Login failed: {login_data}")
-            return
-        jwt = login_data["data"]["jwt"]
-        print(f"[+] JWT received: {jwt[:16]}...")
-        faucet_headers = dict(headers)
-        faucet_headers["authorization"] = f"Bearer {jwt}"
-        status_resp = requests.get(
-            f"{PHAROS_API}/faucet/status?address={address}",
-            headers=faucet_headers,
-            proxies=proxies
-        )
-        status_data = status_resp.json()
-        if status_data.get("data", {}).get("is_able_to_faucet"):
-            claim_resp = requests.post(
-                f"{PHAROS_API}/faucet/daily?address={address}",
-                headers=faucet_headers,
-                proxies=proxies
-            )
-            claim_data = claim_resp.json()
-            if claim_resp.status_code == 200 and claim_data.get("code") == 0:
-                print(f"✅ Faucet successfully claimed for {address}")
-            else:
-                print(f"❌ Error claiming faucet: {claim_data}")
-        else:
-            next_ts = status_data.get("data", {}).get("avaliable_timestamp")
-            if next_ts:
-                readable = datetime.fromtimestamp(next_ts).strftime('%Y-%m-%d %H:%M:%S')
-                print(f"🕐 Faucet will be available at: {readable}")
-            else:
-                print("🚫 Faucet is not available")
-    except Exception as e:
-        print(f"❌ Error while requesting faucet: {e}")
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.post(login_url, headers=headers, proxy=proxy_url) as resp:
+                login_data = await safe_json(resp, f"login {address} (proxy={proxy_url})")
+            if not login_data or login_data.get("code") != 0 or "jwt" not in login_data.get("data", {}):
+                _log(f"[!] Login failed: {login_data}")
+                return
+            jwt = login_data["data"]["jwt"]
+            _log(f"[+] JWT received: {jwt[:16]}...")
 
-def send_10_txs(private_key, proxy=None):
-    from web3 import HTTPProvider
-    import requests
-    if proxy:
-        session = requests.Session()
-        session.proxies = {
-            'http': proxy,
-            'https': proxy
-        }
-        provider = HTTPProvider(PHAROS_RPC, session=session)
-        w3 = Web3(provider)
-    else:
-        w3 = Web3(Web3.HTTPProvider(PHAROS_RPC))
+            faucet_headers = dict(headers)
+            faucet_headers["authorization"] = f"Bearer {jwt}"
+            async with session.get(
+                f"{PHAROS_API}/faucet/status?address={address}",
+                headers=faucet_headers,
+                proxy=proxy_url
+            ) as resp:
+                status_data = await safe_json(resp, f"faucet status {address}")
+            if not status_data:
+                return
+            if status_data.get("data", {}).get("is_able_to_faucet"):
+                async with session.post(
+                    f"{PHAROS_API}/faucet/daily?address={address}",
+                    headers=faucet_headers,
+                    proxy=proxy_url
+                ) as resp:
+                    claim_data = await safe_json(resp, f"faucet claim {address}")
+                if resp.status == 200 and claim_data and claim_data.get("code") == 0:
+                    _log(f"✅ Faucet successfully claimed for {address}")
+                else:
+                    _log(f"❌ Error claiming faucet: {claim_data}")
+            else:
+                next_ts = status_data.get("data", {}).get("avaliable_timestamp")
+                if next_ts:
+                    readable = datetime.fromtimestamp(next_ts).strftime('%Y-%m-%d %H:%M:%S')
+                    _log(f"🕐 Faucet will be available at: {readable}")
+                else:
+                    _log("🚫 Faucet is not available")
+        except Exception as e:
+            proxy_info = f" (proxy={proxy_url})" if proxy_url else ""
+            _log(f"❌ Error while requesting faucet for {address}{proxy_info}: {e}")
+
+async def send_10_txs(private_key, proxy=None):
+    loop = asyncio.get_running_loop()
+    w3 = await loop.run_in_executor(None, get_w3, proxy)
     acct = Account.from_key(private_key)
     address = acct.address
-    print(f"\n{Colors.cyan}▶️ Sending 10 transactions from address: {Colors.bold}{address}{Colors.reset}")
-    nonce = w3.eth.get_transaction_count(address)
+    def _log(msg):
+        log_wallet(address, msg)
+    _log(f"▶️ Sending 10 transactions from address: {address}")
+    nonce = await loop.run_in_executor(None, w3.eth.get_transaction_count, address)
     for i in range(10):
+        if should_stop(address):
+            log_wallet(address, f"⏹️ Sending stopped at TX {i + 1}")
+            break
         to_address = get_random_eth_address()
         value = w3.to_wei(random.uniform(0.00001, 0.0001), 'ether')
         tx = {
@@ -238,26 +191,44 @@ def send_10_txs(private_key, proxy=None):
             'to': to_address,
             'value': value,
             'gas': 21000,
-            'gasPrice': 0,  # Pharos testnet
+            'gasPrice': 0,
             'chainId': 688688,
         }
-        signed_tx = w3.eth.account.sign_transaction(tx, private_key)
-        try:
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-            print(f"{Colors.beige}[{i + 1}/10] TX sent → {to_address}{Colors.reset}")
-            print(f"{Colors.blue}⏳ Waiting for confirmation...{Colors.reset}")
-            receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
-            if receipt.status == 1:
-                print(f"{Colors.green}✅ Confirmed in block {receipt.blockNumber}: {w3.to_hex(tx_hash)}{Colors.reset}")
-            else:
-                print(f"{Colors.red}❌ Transaction failed! {w3.to_hex(tx_hash)}{Colors.reset}")
-        except Exception as e:
-            print(f"{Colors.red}[{i + 1}/10] ❌ Error while sending: {e}{Colors.reset}")
+        max_attempts = 3
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
+            try:
+                signed_tx = await loop.run_in_executor(None, w3.eth.account.sign_transaction, tx, private_key)
+                tx_hash = await loop.run_in_executor(None, w3.eth.send_raw_transaction, signed_tx.raw_transaction)
+                _log(f"[{i + 1}/10] TX sent → {to_address} (attempt {attempt})")
+                _log(f"⏳ Waiting for confirmation...")
+                receipt = await loop.run_in_executor(None, w3.eth.wait_for_transaction_receipt, tx_hash, 120)
+                if receipt.status == 1:
+                    _log(f"✅ Confirmed in block {receipt.blockNumber}: {w3.to_hex(tx_hash)}")
+                else:
+                    _log(f"❌ Transaction failed! {w3.to_hex(tx_hash)}")
+                break
+            except Exception as e:
+                is_replay = False
+                if isinstance(e, dict) and e.get("message") and "TX_REPLAY_ATTACK" in e["message"]:
+                    is_replay = True
+                elif hasattr(e, "args") and e.args and isinstance(e.args[0], dict):
+                    if "message" in e.args[0] and "TX_REPLAY_ATTACK" in e.args[0]["message"]:
+                        is_replay = True
+                _log(f"[{i + 1}/10] ❌ Error while sending (attempt {attempt}): {e}")
+                if is_replay:
+                    _log(f"[{i + 1}/10] ⚠️ TX_REPLAY_ATTACK — skipping further retries for this transaction.")
+                    break
+                if attempt == max_attempts:
+                    _log(f"[{i + 1}/10] ❌ Max retry attempts reached, skipping this transaction.")
+                else:
+                    await asyncio.sleep(3)
         if i != 9:
             delay = random.randint(5, 15)
-            print(f"{Colors.yellow}⏳ Waiting {delay} sec before the next transaction...{Colors.reset}")
-            time.sleep(delay)
-    print(f"{Colors.green}✅ All transactions processed.{Colors.reset}")
+            _log(f"⏳ Waiting {delay} sec before the next transaction...")
+            await asyncio.sleep(delay)
+    _log("✅ All transactions processed.")
 
 def get_collection_and_selfcalls_ahead(offset_seconds=2996):
     now = int(time.time())
@@ -278,20 +249,17 @@ def build_multicall_data(private_key, amount_in_wei, min_out=0, token_in=None, t
     tx_data = multicall_selector + multicall_args
     return tx_data
 
-def perform_swap_right(private_key, amount, min_out, token_in=WPHRS, token_out=USDC, proxy=None):
-    if proxy:
-        session = requests.Session()
-        session.proxies = {"http": proxy, "https": proxy}
-        provider = Web3.HTTPProvider(PHAROS_RPC, session=session)
-        w3 = Web3(provider)
-    else:
-        w3 = Web3(Web3.HTTPProvider(PHAROS_RPC))
+async def perform_swap_right(private_key, amount, min_out, token_in=WPHRS, token_out=USDC, proxy=None):
+    loop = asyncio.get_running_loop()
+    w3 = await loop.run_in_executor(None, get_w3, proxy)
     acct = Account.from_key(private_key)
     address = acct.address
+    def _log(msg):
+        log_wallet(address, msg)
     decimals = 18 if token_in == WPHRS else 6
     amount_in_wei = int(amount * (10 ** decimals))
     tx_data = build_multicall_data(private_key, amount_in_wei, min_out, token_in, token_out)
-    nonce = w3.eth.get_transaction_count(address)
+    nonce = await loop.run_in_executor(None, w3.eth.get_transaction_count, address)
     tx = {
         "from": address,
         "to": Web3.to_checksum_address(SWAP_CONTRACT_ADDRESS),
@@ -302,82 +270,100 @@ def perform_swap_right(private_key, amount, min_out, token_in=WPHRS, token_out=U
         "value": 0,
         "chainId": 688688
     }
-    signed = w3.eth.account.sign_transaction(tx, private_key)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    print(f"{Colors.beige}Транзакция отправлена! Ожидаем подтверждения...{Colors.reset}")
-    print(f"{Colors.blue}{w3.to_hex(tx_hash)}{Colors.reset}")
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-    if receipt.status == 1:
-        print(f"{Colors.green}✅ Swap confirmed in block {receipt.blockNumber}{Colors.reset}")
-    else:
-        print(f"{Colors.red}❌ Swap failed!{Colors.reset}")
+    signed = await loop.run_in_executor(None, w3.eth.account.sign_transaction, tx, private_key)
+    try:
+        tx_hash = await loop.run_in_executor(None, w3.eth.send_raw_transaction, signed.raw_transaction)
+        _log(f"Transaction sent! Waiting for confirmation...")
+        _log(f"TX hash: {w3.to_hex(tx_hash)}")
+        receipt = await loop.run_in_executor(None, w3.eth.wait_for_transaction_receipt, tx_hash)
+        if receipt.status == 1:
+            _log(f"✅ Swap confirmed in block {receipt.blockNumber}")
+        else:
+            _log(f"❌ Swap failed!")
+    except Exception as e:
+        _log(f"❌ Error during swap: {e}")
 
-
-def run_bidirectional_swaps(private_key, amount, min_out, token_in=WPHRS, token_out=USDC, proxy=None):
-    print(f"{Colors.cyan}▶️ Starting forward swap ({token_in} → {token_out}) x5{Colors.reset}")
+async def run_bidirectional_swaps(private_key, amount, min_out, token_in=WPHRS, token_out=USDC, proxy=None):
+    acct = Account.from_key(private_key)
+    address = acct.address
+    def _log(msg):
+        log_wallet(address, msg)
+    _log(f"▶️ Starting forward swap ({token_in} → {token_out}) x5")
     for i in range(5):
-        print(f"{Colors.bold}[{i+1}/10] Forward swap...{Colors.reset}")
-        perform_swap_right(private_key, amount, min_out, token_in, token_out, proxy=proxy)
+        if should_stop(address):
+            _log(f"⏹️ Forward swap interrupted at step {i+1}")
+            return
+        _log(f"[{i+1}/10] Forward swap...")
+        await perform_swap_right(private_key, amount, min_out, token_in, token_out, proxy=proxy)
+        if should_stop(address):
+            _log(f"⏹️ Stopped before waiting delay (forward)")
+            return
         delay = random.randint(5, 15)
-        print(f"{Colors.yellow}⏳ Waiting {delay} sec before next swap...{Colors.reset}")
-        time.sleep(delay)
-    print(f"\n{Colors.cyan}🔁 Starting reverse swap ({token_out} → {token_in}) x5{Colors.reset}")
+        _log(f"⏳ Waiting {delay} sec before next swap...")
+        await asyncio.sleep(delay)
+    _log(f"\n🔁 Starting reverse swap ({token_out} → {token_in}) x5")
     for i in range(5):
-        print(f"{Colors.bold}[{i+6}/10] Reverse swap...{Colors.reset}")
-        perform_swap_right(private_key, amount, min_out, token_out, token_in, proxy=proxy)
+        if should_stop(address):
+            _log(f"⏹️ Reverse swap interrupted at step {i+6}")
+            return
+        _log(f"[{i+6}/10] Reverse swap...")
+        await perform_swap_right(private_key, amount, min_out, token_out, token_in, proxy=proxy)
         if i != 4:
+            if should_stop(address):
+                _log(f"⏹️ Stopped before waiting delay (reverse)")
+                return
             delay = random.randint(5, 15)
-            print(f"{Colors.yellow}⏳ Waiting {delay} sec before next swap...{Colors.reset}")
-            time.sleep(delay)
+            _log(f"⏳ Waiting {delay} sec before next swap...")
+            await asyncio.sleep(delay)
 
-def check_balance_and_approve(private_key, token_address, amount, decimals, spender_address, proxy=None):
-    from web3 import HTTPProvider
-    import requests
-    if proxy:
-        session = requests.Session()
-        session.proxies = {"http": proxy, "https": proxy}
-        provider = HTTPProvider(PHAROS_RPC, session=session)
-        w3 = Web3(provider)
-    else:
-        w3 = Web3(Web3.HTTPProvider(PHAROS_RPC))
+async def check_balance_and_approve(private_key, token_address, amount, decimals, spender_address, proxy=None):
+    loop = asyncio.get_running_loop()
+    w3 = await loop.run_in_executor(None, get_w3, proxy)
     token_address = Web3.to_checksum_address(token_address)
     spender_address = Web3.to_checksum_address(spender_address)
     account = Account.from_key(private_key)
     address = account.address
+
+    def _log(msg):
+        log_wallet(address, msg)
+
     contract = w3.eth.contract(address=token_address, abi=erc20_abi)
-    balance = contract.functions.balanceOf(address).call()
+    balance = await loop.run_in_executor(None, contract.functions.balanceOf(address).call)
     required = int(amount * (10 ** decimals))
     if balance < required:
-        print(f"[!] Insufficient balance: {balance / (10 ** decimals)} < {amount}")
+        _log(f"[!] Insufficient balance: {balance / (10 ** decimals)} < {amount}")
         return False
-    allowance = contract.functions.allowance(address, spender_address).call()
+    allowance = await loop.run_in_executor(None, contract.functions.allowance(address, spender_address).call)
     if allowance < required:
-        print(f"[~] Sending approve of {amount} tokens to {spender_address} ...")
-        nonce = w3.eth.get_transaction_count(address)
+        _log(f"[~] Sending approve of {amount} tokens to {spender_address} ...")
+        nonce = await loop.run_in_executor(None, w3.eth.get_transaction_count, address)
         tx = contract.functions.approve(spender_address, 2**256-1).build_transaction({
             'from': address,
             'nonce': nonce,
             'gas': 70000,
             'gasPrice': 0,
         })
-        signed = w3.eth.account.sign_transaction(tx, private_key)
-        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-        print(f"[✓] Approve sent: {w3.to_hex(tx_hash)}")
-        receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+        signed = await loop.run_in_executor(None, w3.eth.account.sign_transaction, tx, private_key)
+        tx_hash = await loop.run_in_executor(None, w3.eth.send_raw_transaction, signed.raw_transaction)
+        _log(f"[✓] Approve sent: {w3.to_hex(tx_hash)}")
+        receipt = await loop.run_in_executor(None, w3.eth.wait_for_transaction_receipt, tx_hash)
         if receipt.status != 1:
-            print(f"[!] Approve failed!")
+            _log(f"[!] Approve failed!")
             return False
-        time.sleep(2)
+        await asyncio.sleep(2)
     else:
-        print(f"[✓] Approve already exists")
+        _log(f"[✓] Approve already exists")
     return True
 
-def get_jwt(api, address, force_refresh=False, proxy=None):
+async def get_jwt(api, address, force_refresh=False, proxy=None):
     jwt_path = f"jwt_{address}.txt"
+    def _log(msg):
+        log_wallet(address, msg)
     if os.path.exists(jwt_path) and not force_refresh:
         with open(jwt_path, "r") as f:
             jwt = f.read().strip()
             if jwt:
+                _log(f"[+] JWT loaded from file for {address[:10]}...")
                 return jwt
     message = encode_defunct(text="pharos")
     signed_message = Account.sign_message(message, api)
@@ -388,30 +374,41 @@ def get_jwt(api, address, force_refresh=False, proxy=None):
         "user-agent": "Mozilla/5.0 (compatible)",
         "Referer": "https://testnet.pharosnetwork.xyz/",
     }
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    try:
-        resp = requests.post(login_url, headers=headers, proxies=proxies, timeout=20)
-        data = resp.json()
-    except Exception as e:
-        print(f"[!] Error while obtaining JWT: {e}")
-        return None
+    proxy_url = normalize_proxy(proxy) if proxy else None
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.post(login_url, headers=headers, proxy=proxy_url) as resp:
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    _log(f"[!] JWT login response not JSON for {address} (proxy={proxy_url})")
+                    return None
+        except Exception as e:
+            _log(f"[!] Error while obtaining JWT for {address}: {e}")
+            return None
     if data.get("code") == 0 and data.get("data", {}).get("jwt"):
         jwt = data["data"]["jwt"]
         with open(jwt_path, "w") as f:
             f.write(jwt)
-        print(f"[+] JWT for {address[:10]}... saved.")
+        _log(f"[+] JWT for {address[:10]}... saved.")
         return jwt
     else:
-        print(f"[!] Failed to obtain JWT for {address}: {data}")
+        _log(f"[!] Failed to obtain JWT for {address}: {data}")
         return None
 
 def get_random_eth_address():
     random_account = Account.create()
     return random_account.address
 
-def perform_check_in(private_key, proxy=None):
+async def perform_check_in(private_key, proxy=None):
+    proxy_url = normalize_proxy(proxy) if proxy else None
+    timeout = aiohttp.ClientTimeout(total=30)
     acct = Account.from_key(private_key)
     address = acct.address
+
+    def _log(msg):
+        log_wallet(address, msg)
     message = encode_defunct(text="pharos")
     signed_message = Account.sign_message(message, private_key)
     signature = signed_message.signature.hex()
@@ -431,74 +428,88 @@ def perform_check_in(private_key, proxy=None):
         "Referrer-Policy": "strict-origin-when-cross-origin",
         "User-Agent": "Mozilla/5.0 (compatible)",
     }
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    try:
-        resp = requests.post(login_url, headers=headers, proxies=proxies, timeout=20)
-        data = resp.json()
-    except Exception as e:
-        print(f"[!] Login error: {e}")
-        return False
-    if data.get("code") != 0 or "jwt" not in data.get("data", {}):
-        print(f"[!] Login failed: {data}")
-        return False
-    jwt = data["data"]["jwt"]
-    print(f"[+] JWT obtained: {jwt[:16]}...")
-    checkin_url = f"https://api.pharosnetwork.xyz/sign/in?address={address}"
-    checkin_headers = dict(headers)
-    checkin_headers["authorization"] = f"Bearer {jwt}"
-    try:
-        resp = requests.post(checkin_url, headers=checkin_headers, proxies=proxies, timeout=20)
-        checkin_data = resp.json()
-    except Exception as e:
-        print(f"[!] Check-in error: {e}")
-        return False
-    if checkin_data.get("code") == 0:
-        print(f"[+] Check-in successful for {address}")
-        return True
-    else:
-        print(f"[!] Check-in failed: {checkin_data.get('msg')}")
-        return False
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.post(login_url, headers=headers, proxy=proxy_url) as resp:
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    _log(f"[!] Login response not JSON for {address} (proxy={proxy_url})")
+                    return False
+        except Exception as e:
+            _log(f"[!] Login error for {address}: {e}")
+            return False
+        if data.get("code") != 0 or "jwt" not in data.get("data", {}):
+            _log(f"[!] Login failed: {data}")
+            return False
+        jwt = data["data"]["jwt"]
+        _log(f"[+] JWT obtained: {jwt[:16]}...")
+        checkin_url = f"https://api.pharosnetwork.xyz/sign/in?address={address}"
+        checkin_headers = dict(headers)
+        checkin_headers["authorization"] = f"Bearer {jwt}"
+        try:
+            async with session.post(checkin_url, headers=checkin_headers, proxy=proxy_url) as resp:
+                try:
+                    checkin_data = await resp.json(content_type=None)
+                except Exception:
+                    _log(f"[!] Check-in response not JSON for {address}")
+                    return False
+        except Exception as e:
+            _log(f"[!] Check-in error for {address}: {e}")
+            return False
+        if checkin_data.get("code") == 0:
+            _log(f"[+] Check-in successful for {address}")
+            return True
+        else:
+            _log(f"[!] Check-in failed: {checkin_data.get('msg')}")
+            return False
 
-def approve_token(token_address, private_key, proxy=None):
-    import requests
-    from web3 import HTTPProvider
+async def approve_token(token_address, private_key, proxy=None):
+    loop = asyncio.get_running_loop()
+    w3_local = await loop.run_in_executor(None, get_w3, proxy)
     acct = Account.from_key(private_key)
-    if proxy:
-        session = requests.Session()
-        session.proxies = {"http": proxy, "https": proxy}
-        w3_local = Web3(HTTPProvider(PHAROS_RPC, session=session))
-    else:
-        w3_local = Web3(Web3.HTTPProvider(PHAROS_RPC))
+    token_address = Web3.to_checksum_address(token_address)
+    pm_address = Web3.to_checksum_address(POSITION_MANAGER)
+    acct_address = Web3.to_checksum_address(acct.address)
+    def _log(msg):
+        log_wallet(acct_address, msg)
     token = w3_local.eth.contract(address=token_address, abi=erc20_abi)
-    allowance = token.functions.allowance(acct.address, POSITION_MANAGER).call()
+    allowance = await loop.run_in_executor(None, token.functions.allowance(acct_address, pm_address).call)
     if allowance > 0:
-        print(f"{Colors.blue}ℹ️ Token {token_address} is already approved, skipping approve.{Colors.reset}")
+        _log(f"ℹ️ Token {token_address} is already approved, skipping approve.")
         return
-    tx = token.functions.approve(POSITION_MANAGER, 2 ** 256 - 1).build_transaction({
-        "from": acct.address,
-        "nonce": w3_local.eth.get_transaction_count(acct.address),
+    nonce = await loop.run_in_executor(None, w3_local.eth.get_transaction_count, acct_address)
+    tx = token.functions.approve(pm_address, 2 ** 256 - 1).build_transaction({
+        "from": acct_address,
+        "nonce": nonce,
         "gas": 60000,
         "gasPrice": w3_local.to_wei(1, 'gwei'),
         "chainId": 688688
     })
-    signed = w3_local.eth.account.sign_transaction(tx, private_key)
-    tx_hash = w3_local.eth.send_raw_transaction(signed.raw_transaction)
-    print(f"{Colors.green}🟢 Approve TX sent: {w3_local.to_hex(tx_hash)}{Colors.reset}")
-    w3_local.eth.wait_for_transaction_receipt(tx_hash)
+    signed = await loop.run_in_executor(None, w3_local.eth.account.sign_transaction, tx, private_key)
+    tx_hash = await loop.run_in_executor(None, w3_local.eth.send_raw_transaction, signed.raw_transaction)
+    _log(f"🟢 Approve TX sent: {w3_local.to_hex(tx_hash)}")
+    await loop.run_in_executor(None, w3_local.eth.wait_for_transaction_receipt, tx_hash)
 
-def mint_liquidity(pk, proxy=None):
-    import requests
-    from web3 import HTTPProvider
+async def mint_liquidity(pk, proxy=None):
+    loop = asyncio.get_running_loop()
+    w3_local = await loop.run_in_executor(None, get_w3, proxy)
     acct = Account.from_key(pk)
-    if proxy:
-        session = requests.Session()
-        session.proxies = {"http": proxy, "https": proxy}
-        w3_local = Web3(HTTPProvider(PHAROS_RPC, session=session))
-    else:
-        w3_local = Web3(Web3.HTTPProvider(PHAROS_RPC))
-    position_manager = w3_local.eth.contract(address=POSITION_MANAGER, abi=position_manager_abi)
-    for i in range(10):
-        print(f"{Colors.cyan}[{i+1}/10] Adding liquidity...{Colors.reset}")
+    acct_address = Web3.to_checksum_address(acct.address)
+    def _log(msg):
+        log_wallet(acct_address, msg)
+    position_manager = w3_local.eth.contract(
+        address=Web3.to_checksum_address(POSITION_MANAGER),
+        abi=POSITION_MANAGER_ABI
+    )
+    success_count = 0
+    attempt = 0
+    while success_count < 10:
+        if should_stop(acct_address):
+            log_wallet(acct_address, "⏹️ Liquidity minting stopped.")
+            break
+        attempt += 1
+        _log(f"[{success_count + 1}/10] Adding liquidity (attempt {attempt})...")
         try:
             token0 = Web3.to_checksum_address(WPHRS)
             token1 = Web3.to_checksum_address(USDC)
@@ -508,6 +519,7 @@ def mint_liquidity(pk, proxy=None):
             deadline = int(time.time()) + 600
             tick_lower = -887220
             tick_upper = 887220
+            nonce = await loop.run_in_executor(None, w3_local.eth.get_transaction_count, acct_address)
             tx = position_manager.functions.mint({
                 "token0": token0,
                 "token1": token1,
@@ -518,67 +530,55 @@ def mint_liquidity(pk, proxy=None):
                 "amount1Desired": amount1_desired,
                 "amount0Min": 0,
                 "amount1Min": 0,
-                "recipient": acct.address,
+                "recipient": acct_address,
                 "deadline": deadline
             }).build_transaction({
-                "from": acct.address,
+                "from": acct_address,
                 "gas": 600000,
                 "gasPrice": w3_local.to_wei(1, 'gwei'),
-                "nonce": w3_local.eth.get_transaction_count(acct.address),
+                "nonce": nonce,
                 "chainId": 688688
             })
-            signed = w3_local.eth.account.sign_transaction(tx, pk)
-            tx_hash = w3_local.eth.send_raw_transaction(signed.raw_transaction)
-            print(f"{Colors.beige}✅ Transaction sent: {w3_local.to_hex(tx_hash)}{Colors.reset}")
-            receipt = w3_local.eth.wait_for_transaction_receipt(tx_hash)
+            signed = await loop.run_in_executor(None, w3_local.eth.account.sign_transaction, tx, pk)
+            tx_hash = await loop.run_in_executor(None, w3_local.eth.send_raw_transaction, signed.raw_transaction)
+            _log(f"Transaction sent! Waiting for confirmation...")
+            receipt = await loop.run_in_executor(None, w3_local.eth.wait_for_transaction_receipt, tx_hash)
             if receipt.status == 1:
-                print(f"{Colors.green}🎉 Liquidity added successfully! Block: {receipt.blockNumber}{Colors.reset}")
+                _log(f"🎉 Liquidity added successfully! Block: {receipt.blockNumber}")
+                success_count += 1
             else:
-                print(f"{Colors.red}❌ Error while adding liquidity.{Colors.reset}")
+                _log(f"❌ Error while adding liquidity (tx failed).")
         except Exception as e:
-            print(f"{Colors.red}[!] Error on attempt {i+1}: {e}{Colors.reset}")
+            _log(f"[!] Error on attempt {attempt}: {e}")
+            await asyncio.sleep(3)
             continue
-        if i != 9:
+        if success_count < 10:
             delay = random.randint(5, 15)
-            print(f"{Colors.yellow}⏳ Waiting {delay} sec before the next attempt...{Colors.reset}")
-            time.sleep(delay)
+            _log(f"⏳ Waiting {delay} sec before the next attempt...")
+            await asyncio.sleep(delay)
 
-
-def show_menu():
-    print("\nWhat would you like to do?")
-    print("1. Perform check-in")
-    print("2. Claim tokens from faucet")
-    print("3. Send 10 transactions")
-    print("4. Perform 10 swaps")
-    print("5. Perform 10 liquidity adds (staking)")
-    print("6. Do everything (sequentially)")
-    print("7. Loop everything endlessly\n")
-    while True:
-        choice = input("Enter the action number and press Enter: ")
-        if choice in {'1', '2', '3', '4', '5', '6', '7'}:
-            return int(choice)
-        print("Invalid input. Please try again.")
-
-def run_all_tasks(pk, address, proxy):
-    jwt = get_jwt(pk, address, False, proxy)
+async def run_all_tasks(pk, address, proxy):
+    jwt = await get_jwt(pk, address, False, proxy)
     if not jwt:
         return
-    check_daily_status(address, jwt, pk, proxy)
-    claim_faucet(pk, proxy)
-    send_10_txs(pk, proxy)
+    await check_daily_status(address, jwt, pk, proxy)
+    await claim_faucet(pk, proxy)
+    await send_10_txs(pk, proxy)
     amount = 0.001
     decimals = 18
     min_out = 0
     token_in = WPHRS
     token_out = USDC
-    ok = check_balance_and_approve(pk, token_in, amount, decimals, SWAP_CONTRACT_ADDRESS, proxy)
+    ok = await check_balance_and_approve(pk, token_in, amount, decimals, SWAP_CONTRACT_ADDRESS, proxy)
     if ok:
-        run_bidirectional_swaps(pk, amount, min_out, token_in, token_out, proxy=proxy)
-    approve_token(Web3.to_checksum_address(WPHRS), pk, proxy)
-    approve_token(Web3.to_checksum_address(USDC), pk, proxy)
-    mint_liquidity(pk, proxy)
+        await run_bidirectional_swaps(pk, amount, min_out, token_in, token_out, proxy=proxy)
+    await approve_token(Web3.to_checksum_address(WPHRS), pk, proxy)
+    await approve_token(Web3.to_checksum_address(USDC), pk, proxy)
+    await mint_liquidity(pk, proxy)
 
-def check_daily_status(address, jwt, private_key=None, proxy=None):
+async def check_daily_status(address, jwt, private_key=None, proxy=None):
+    def _log(msg):
+        log_wallet(address, msg)
     url = f"{PHAROS_API}/faucet/status?address={address}"
     headers = {
         "accept": "application/json, text/plain, */*",
@@ -586,109 +586,170 @@ def check_daily_status(address, jwt, private_key=None, proxy=None):
         "authorization": f"Bearer {jwt}",
         "Referer": "https://testnet.pharosnetwork.xyz/",
     }
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-    try:
-        resp = requests.get(url, headers=headers, proxies=proxies, timeout=15)
-        data = resp.json()
-    except Exception as e:
-        print(f"[!] Error fetching faucet status: {e}")
+    proxy_url = normalize_proxy(proxy) if proxy else None
+    timeout = aiohttp.ClientTimeout(total=20)
+    data = None
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.get(url, headers=headers, proxy=proxy_url) as resp:
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception as e:
+                    text = await resp.text()
+                    _log(f"[!] Error parsing JSON for status {address}: {e} (Raw: {text})")
+                    return
+        except Exception as e:
+            _log(f"[!] Error fetching faucet status: {e}")
+            return
+    _log(f"=== Check-in status for {address} ===")
+    if not isinstance(data, dict):
+        _log(f"[!] No or bad data received for check-in status! data={data}")
         return
-    print(f"\n=== Check-in status for {address} ===")
     if data.get("code") == 0 and data.get("data"):
         d = data["data"]
-        if d["is_able_to_faucet"]:
-            print("✅ You can check-in right now!")
+        if d.get("is_able_to_faucet"):
+            _log("✅ You can check-in right now!")
             if private_key is not None:
-                success = perform_check_in(private_key, proxy=proxy)
+                success = await perform_check_in(private_key, proxy=proxy)
                 if success:
-                    print("✅ Check-in successful!")
+                    _log("✅ Check-in successful!")
                 else:
-                    print("❌ Failed to check-in.")
+                    _log("❌ Failed to check-in.")
         else:
-            ts = d["avaliable_timestamp"]
-            next_time = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
-            print(f"✅ Already checked in.\nNext check-in will be available at: {next_time}")
+            ts = d.get("avaliable_timestamp")
+            if ts:
+                next_time = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
+                _log(f"✅ Already checked in. Next check-in will be available at: {next_time}")
+            else:
+                _log("✅ Already checked in. (No timestamp available)")
     else:
-        print(f"[!] Error checking status: {data}")
-
-def load_private_keys():
-    if not os.path.exists(KEYS_PATH):
-        print(f"[!] File {KEYS_PATH} not found!")
-        return []
-    with open(KEYS_PATH, "r") as f:
-        keys = [line.strip() for line in f if line.strip()]
-    return keys
+        _log(f"[!] Error checking status: {data}")
 
 
-if __name__ == "__main__":
+async def run_wallet(pk, proxy):
+    acct = Account.from_key(pk)
+    address = acct.address
+    log_wallet(address, f"▶️ Wallet runner started with proxy {proxy}")
+    while True:
+        status = WALLET_STATUS.get(address)
+        if not isinstance(status, dict):
+            log_wallet(address, f"[DEBUG] WALLET_STATUS[{address}] is not dict: {repr(status)} — setting to idle")
+            set_wallet_status(address, "idle")
+            await asyncio.sleep(1)
+            continue
+        if status.get("status") == "global_looping" and GLOBAL_LOOP_EVENT.is_set():
+            log_wallet(address, "[DEBUG] === GLOBAL LOOP BRANCH ===")
+            set_wallet_status(address, "global_looping", status.get("task", "all"))
+            while (
+                WALLET_STATUS.get(address, {}).get("status") == "global_looping"
+                and GLOBAL_LOOP_EVENT.is_set()):
+                task = WALLET_STATUS.get(address, {}).get("task", "all")
+                log_wallet(address, f"[DEBUG] GLOBAL_LOOP: task={task}")
+                try:
+                    await handle_task(pk, address, proxy, task)
+                except Exception as e:
+                    log_wallet(address, f"❌ [GLOBAL LOOP] Error: {e}")
+                if (
+                    should_stop(address)
+                    or WALLET_STATUS.get(address, {}).get("status") != "global_looping"
+                    or not GLOBAL_LOOP_EVENT.is_set()
+                ):
+                    set_wallet_status(address, "idle")
+                    break
+                with config_lock:
+                    interval_minutes = GLOBAL_CONFIG.get("loop_interval", 60)
+                delay = interval_minutes * 60
+                log_wallet(address, f"[DEBUG] GLOBAL_LOOP: sleep for {delay} seconds (interval param: {interval_minutes})")
+                for _ in range(delay):
+                    if (
+                        should_stop(address)
+                        or WALLET_STATUS.get(address, {}).get("status") != "global_looping"
+                        or not GLOBAL_LOOP_EVENT.is_set()):
+                        break
+                    await asyncio.sleep(1)
+            continue
+
+        elif status.get("status") == "looping":
+            interval = LOOP_INTERVALS.get(address, 60)
+            set_wallet_status(address, "looping", status.get("task", "all"))
+            while WALLET_STATUS.get(address, {}).get("status") == "looping":
+                task = status.get("task", "all")
+                log_wallet(address, f"[DEBUG] LOOP: task={task}")
+                try:
+                    await handle_task(pk, address, proxy, task)
+                except Exception as e:
+                    log_wallet(address, f"❌ [LOOP] Error: {e}")
+                if should_stop(address) or WALLET_STATUS.get(address, {}).get("status") != "looping":
+                    set_wallet_status(address, "idle")
+                    break
+                delay = interval * 60
+                for _ in range(delay):
+                    if should_stop(address) or WALLET_STATUS.get(address, {}).get("status") != "looping":
+                        break
+                    await asyncio.sleep(1)
+            continue
+
+        elif status.get("status") == "running":
+            if should_stop(address):
+                log_wallet(address, f"⏹️ Task was stopped.")
+                set_wallet_status(address, "idle")
+                continue
+            task = status.get("task", "all")
+            set_wallet_status(address, "running", task)
+            try:
+                await handle_task(pk, address, proxy, task)
+            except Exception as e:
+                log_wallet(address, f"❌ Error during task {task}: {e}")
+            set_wallet_status(address, "idle")
+            await asyncio.sleep(2)
+            continue
+        await asyncio.sleep(1)
+        continue
+
+async def handle_task(pk, address, proxy, task):
+    if task == "check_in":
+        jwt = await get_jwt(pk, address, False, proxy)
+        if jwt:
+            await check_daily_status(address, jwt, pk, proxy)
+    elif task == "claim_faucet":
+        await claim_faucet(pk, proxy)
+    elif task == "send_txs":
+        await send_10_txs(pk, proxy)
+    elif task == "perform_swaps":
+        amount = 0.001
+        min_out = 0
+        amount_wphrs = amount
+        amount_usdc = 1
+        ok1 = await check_balance_and_approve(pk, WPHRS, amount_wphrs, 18, SWAP_CONTRACT_ADDRESS, proxy)
+        ok2 = await check_balance_and_approve(pk, USDC, amount_usdc, 6, SWAP_CONTRACT_ADDRESS, proxy)
+        if ok1 and ok2:
+            await run_bidirectional_swaps(pk, amount, min_out, WPHRS, USDC, proxy)
+        else:
+            log_wallet(address, "⚠️ Skipped swaps due to missing approvals.")
+    elif task == "add_liquidity":
+        await approve_token(WPHRS, pk, proxy)
+        await approve_token(USDC, pk, proxy)
+        await mint_liquidity(pk, proxy)
+    elif task == "all":
+        await run_all_tasks(pk, address, proxy)
+
+async def main():
     private_keys = load_private_keys()
     proxies = load_proxies()
     if not private_keys:
         print("[!] No private keys found.")
-        exit(1)
+        return
     if not proxies:
         print("[!] No proxies found, all wallets will run without proxy.")
         proxies = [None] * len(private_keys)
     elif len(proxies) < len(private_keys):
-        print("[!] Number of proxies is less than number of private keys. Proxies will be reused.")
+        print("[!] Number of proxies is less than private keys — reusing proxies.")
         proxies *= (len(private_keys) // len(proxies)) + 1
-
-    choice = show_menu()
-
+    tasks = []
     for i, pk in enumerate(private_keys):
         proxy = proxies[i]
-        try:
-            acct = Account.from_key(pk)
-            address = acct.address
-            print(f"\n[~] Using wallet: {address} with proxy: {proxy}")
-            jwt = get_jwt(pk, address, False, proxy)
-            if not jwt:
-                continue
+        tasks.append(asyncio.create_task(run_wallet(pk, proxy)))
+    await asyncio.gather(*tasks)
 
-            if choice == 1:
-                check_daily_status(address, jwt, pk, proxy)
-            elif choice == 2:
-                claim_faucet(pk, proxy)
-            elif choice == 3:
-                send_10_txs(pk, proxy)
-            elif choice == 4:
-                amount = 0.001
-                decimals = 18
-                min_out = 0
-                token_in = WPHRS
-                token_out = USDC
-                ok = check_balance_and_approve(pk, token_in, amount, decimals, SWAP_CONTRACT_ADDRESS, proxy)
-                if ok:
-                    run_bidirectional_swaps(pk, amount, min_out, token_in, token_out, proxy=proxy)
-                else:
-                    print(f"{Colors.red}[!] Swap skipped due to insufficient wPHRS balance or no approval.{Colors.reset}")
-            elif choice == 5:
-                approve_token(Web3.to_checksum_address(WPHRS), pk, proxy)
-                approve_token(Web3.to_checksum_address(USDC), pk, proxy)
-                mint_liquidity(pk, proxy)
-            elif choice == 6:
-                run_all_tasks(pk, address, proxy)
-            if choice == 7:
-                interval_min = input("Enter interval between runs in minutes: ").strip()
-                try:
-                    interval_min = int(interval_min)
-                    if interval_min <= 0:
-                        raise ValueError
-                except ValueError:
-                    print("[!] Invalid input. Using default value: 60 minutes.")
-                    interval_min = 60
-                print(f"\n🔁 Starting infinite loop with interval {interval_min} minutes.\nPress Ctrl+C to stop.\n")
-                while True:
-                    for i, pk in enumerate(private_keys):
-                        proxy = proxies[i]
-                        try:
-                            acct = Account.from_key(pk)
-                            address = acct.address
-                            print(f"\n[~] Using wallet: {address} with proxy: {proxy}")
-                            run_all_tasks(pk, address, proxy)
-                        except Exception as e:
-                            print(f"[!] Error on wallet {pk[:10]}...: {e}")
-                    print(f"\n⏳ Waiting {interval_min} minutes before next cycle...\n")
-                    time.sleep(interval_min * 60)
-        except Exception as e:
-            print(f"[!] Error on wallet {pk[:10]}...: {e}")
+if __name__ == "__main__":
+    asyncio.run(main())
