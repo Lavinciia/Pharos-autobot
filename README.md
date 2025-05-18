@@ -50,6 +50,8 @@ Example:
 Go to http://localhost:8080  
 Control all wallets, launch loops, view logs, and manage tasks from a single dashboard!
 
+**SWAP MANUALLY SOME PHRS TO USDC AND wPHRS (FOR EXAMPLE 0.07 OF PHRS TO EACH COIN** 
+
 ---
 
 ## 🔁 Farming Loops & Automation  
