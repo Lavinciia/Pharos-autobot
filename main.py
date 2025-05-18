@@ -106,10 +106,8 @@ async def claim_faucet(pk, proxy=None):
     timeout = aiohttp.ClientTimeout(total=30)
     acct = Account.from_key(pk)
     address = acct.address
-
     def _log(msg):
         log_wallet(address, msg)
-
     message = encode_defunct(text="pharos")
     signed_message = Account.sign_message(message, pk)
     signature = signed_message.signature.hex()
@@ -129,47 +127,63 @@ async def claim_faucet(pk, proxy=None):
         "Referrer-Policy": "strict-origin-when-cross-origin",
         "User-Agent": "Mozilla/5.0 (compatible)"
     }
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    max_retries = 3
+    attempt = 0
+    while attempt < max_retries:
         try:
-            async with session.post(login_url, headers=headers, proxy=proxy_url) as resp:
-                login_data = await safe_json(resp, f"login {address} (proxy={proxy_url})")
-            if not login_data or login_data.get("code") != 0 or "jwt" not in login_data.get("data", {}):
-                _log(f"[!] Login failed: {login_data}")
-                return
-            jwt = login_data["data"]["jwt"]
-            _log(f"[+] JWT received: {jwt[:16]}...")
-
-            faucet_headers = dict(headers)
-            faucet_headers["authorization"] = f"Bearer {jwt}"
-            async with session.get(
-                f"{PHAROS_API}/faucet/status?address={address}",
-                headers=faucet_headers,
-                proxy=proxy_url
-            ) as resp:
-                status_data = await safe_json(resp, f"faucet status {address}")
-            if not status_data:
-                return
-            if status_data.get("data", {}).get("is_able_to_faucet"):
-                async with session.post(
-                    f"{PHAROS_API}/faucet/daily?address={address}",
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(login_url, headers=headers, proxy=proxy_url) as resp:
+                    login_data = await safe_json(resp, f"login {address} (proxy={proxy_url})")
+                if not login_data or login_data.get("code") != 0 or "jwt" not in login_data.get("data", {}):
+                    _log(f"[!] Login failed: {login_data}")
+                    attempt += 1
+                    await asyncio.sleep(2)
+                    continue
+                jwt = login_data["data"]["jwt"]
+                _log(f"[+] JWT received: {jwt[:16]}...")
+                faucet_headers = dict(headers)
+                faucet_headers["authorization"] = f"Bearer {jwt}"
+                async with session.get(
+                    f"{PHAROS_API}/faucet/status?address={address}",
                     headers=faucet_headers,
                     proxy=proxy_url
                 ) as resp:
-                    claim_data = await safe_json(resp, f"faucet claim {address}")
-                if resp.status == 200 and claim_data and claim_data.get("code") == 0:
-                    _log(f"✅ Faucet successfully claimed for {address}")
+                    status_data = await safe_json(resp, f"faucet status {address}")
+                if not status_data:
+                    attempt += 1
+                    await asyncio.sleep(2)
+                    continue
+                if status_data.get("data", {}).get("is_able_to_faucet"):
+                    async with session.post(
+                        f"{PHAROS_API}/faucet/daily?address={address}",
+                        headers=faucet_headers,
+                        proxy=proxy_url
+                    ) as resp:
+                        claim_data = await safe_json(resp, f"faucet claim {address}")
+                    if resp.status == 200 and claim_data and claim_data.get("code") == 0:
+                        _log(f"✅ Faucet successfully claimed for {address}")
+                        return True
+                    else:
+                        _log(f"❌ Error claiming faucet: {claim_data}")
+                        attempt += 1
+                        await asyncio.sleep(2)
+                        continue
                 else:
-                    _log(f"❌ Error claiming faucet: {claim_data}")
-            else:
-                next_ts = status_data.get("data", {}).get("avaliable_timestamp")
-                if next_ts:
-                    readable = datetime.fromtimestamp(next_ts).strftime('%Y-%m-%d %H:%M:%S')
-                    _log(f"🕐 Faucet will be available at: {readable}")
-                else:
-                    _log("🚫 Faucet is not available")
+                    next_ts = status_data.get("data", {}).get("avaliable_timestamp")
+                    if next_ts:
+                        readable = datetime.fromtimestamp(next_ts).strftime('%Y-%m-%d %H:%M:%S')
+                        _log(f"🕐 Faucet will be available at: {readable}")
+                    else:
+                        _log("🚫 Faucet is not available")
+                    return False
         except Exception as e:
+            attempt += 1
             proxy_info = f" (proxy={proxy_url})" if proxy_url else ""
             _log(f"❌ Error while requesting faucet for {address}{proxy_info}: {e}")
+            await asyncio.sleep(2)
+    _log(f"❌ All attempts to claim faucet for {address} failed after {max_retries} tries.")
+    return False
+
 
 async def send_10_txs(private_key, proxy=None):
     loop = asyncio.get_running_loop()
@@ -355,7 +369,7 @@ async def check_balance_and_approve(private_key, token_address, amount, decimals
         _log(f"[✓] Approve already exists")
     return True
 
-async def get_jwt(api, address, force_refresh=False, proxy=None):
+async def get_jwt(pk, address, force_refresh=False, proxy=None):
     jwt_path = f"jwt_{address}.txt"
     def _log(msg):
         log_wallet(address, msg)
@@ -366,7 +380,7 @@ async def get_jwt(api, address, force_refresh=False, proxy=None):
                 _log(f"[+] JWT loaded from file for {address[:10]}...")
                 return jwt
     message = encode_defunct(text="pharos")
-    signed_message = Account.sign_message(message, api)
+    signed_message = Account.sign_message(message, pk)
     signature = signed_message.signature.hex()
     login_url = f"{PHAROS_API}/user/login?address={address}&signature={signature}&invite_code={INVITE_CODE}"
     headers = {
