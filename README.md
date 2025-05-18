@@ -29,7 +29,7 @@ This is a huge update of the previous version: now with true multithreading, mul
 
 ## 🖥 How to Use  
 **Clone the repo:**  
-`git clone https://github.com/yourusername/pharos-autobot.git`
+`git clone https://github.com/Lavinciia/pharos-autobot.git`
 
 **Install dependencies:**  
 `pip install -r requirements.txt`
